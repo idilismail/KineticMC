@@ -59,12 +59,12 @@ Program SSA
   real(8) :: tau, sum, sumprop, time
   real(8) :: ran2
   real(8) :: volume, bincount(NMOLMAX, NOUT)
-  real(8) :: Kdiff, Keq,del
+  real(8) :: Kdiff, Keq,del,cond
   real(8) :: pressure, conc(NMOLMAX), pop_init_store(NMOLMAX),psd(NMOLMAX,NOUT),pbin(NMOLMAX,NOUT)
   real(8) :: flux(NRXNMAX), fluxtot, sflux(NMOLMAX), popsd(NMOLMAX,NOUT),Tbin(NOUT)
   real(8) :: Tout(NOUT), popout(NMOLMAX,NOUT), popsave(NMOLMAX,NRUNMAX,NOUT),Tsave(NRUNMAX,NOUT)
   real(8) :: covar(NRXNMAX,NRXNMAX),Fnew,Fold,de,prob,Gold,step,ratio
-
+  real(8), allocatable :: cov_new(:,:), inv_cov_new(:,:)
   logical :: gvconnect(NRXNMAX), dynamic_graph, Readout(NOUT), rfound(NRXNMAX), readrates
   logical :: usecovar,readout_temp(NOUT)
 
@@ -187,14 +187,24 @@ Program SSA
         !       The covariance matrix should be given in ATOMIC UNITS (Eh**2).
         !
         if (usecovar) then
+          
+           allocate(cov_new(nrxn/2,nrxn/2))
+           allocate(inv_cov_new(nrxn/2,nrxn/2))
+
            open(10,file='covar.dat',status='unknown')
            do i = 1, nrxn/2
               do j = 1, nrxn/2
                  read(10,*)idum,jdum,covar(i,j)
                  covar(i,j) = covar(i,j) * (tokjmol * tokjmol)
+                 cov_new(i,j) = covar(i,j)
               enddo
            enddo
            close(10)
+
+           ! Calculate inverse covariance matrix:
+           !
+           Call SVD_inverse(cov_new, inv_cov_new, nrxn/2, cond, 1d-12)
+            
 
            ! Set number of MC samples and step-size (Hartrees)
            !
@@ -235,7 +245,7 @@ Program SSA
               sum = 0.d0
               do j = 1, nrxn/2
                  do k = 1, nrxn/2
-                  sum = sum + 0.5 * (Gts(j) - Gts_mean(j)) * (Gts(k) - Gts_mean(k)) / covar(j,k)
+                  sum = sum + 0.5 * (Gts(j) - Gts_mean(j)) *inv_cov_new(j,k)* (Gts(k) - Gts_mean(k))
                  enddo
               enddo
               Fnew = exp(-sum)
@@ -263,6 +273,8 @@ Program SSA
              write(6,*)'BACKWARDS: ',jj,Gts(jj),Gts_mean(jj)
              if (Gts(jj).lt.0.d0)then
                write(6,*) 'ERROR: NEGATIVE BACKWARDS BARRIER AFTER SAMPLING COVARIANCE '
+               deallocate(cov_new)
+               deallocate(inv_cov_new)
                goto 91
              endif
            enddo
@@ -281,14 +293,18 @@ Program SSA
              write(66,*)i,Gts(i),Gts_mean(i)
            enddo
 
+           deallocate(cov_new)
+           deallocate(inv_cov_new)
+
         endif
 
         do i = 1, NOUT
            readout_temp(i) = .FALSE.
         enddo
-
+        write(6,*)'INTO STOCHASTIC';call flush(6)
         Call Stochastic(Tstop,pop,ktst,rid,pid,rxntype,prodtype,volume,nrxn,nmol,irun,stoich,flux, &
              ir,popsave,Tsave,log_file,fluxtot,readout_temp)
+        write(6,*)'OUT OF STOCHASTIC';call flush(6)
 
         do i = 1, NOUT 
            if (readout_temp(i)) then
@@ -1581,9 +1597,11 @@ Subroutine Stochastic(Tstop,pop,ktst,rid,pid,rxntype,prodtype,volume,nrxn,nmol,i
            jj = rid(2,i)
 
            if (ii /= jj) then
-              propens(i) = 1d-3*pop(ii) * pop(jj) * ktst(i) / (navogadro*Volume)
+             ! propens(i) = 1d-3*pop(ii) * pop(jj) * ktst(i) / (navogadro*Volume)
+              propens(i) = pop(ii) * pop(jj) * ktst(i) / (Volume)
            else if (ii == jj) then
-              propens(i) = 1d-3*(0.5*pop(ii)*(pop(ii)-1)) * ktst(i) / (navogadro*Volume)   ! Note factor of 2 here
+            !  propens(i) = 1d-3*(0.5*pop(ii)*(pop(ii)-1)) * ktst(i) / (navogadro*Volume)   ! Note factor of 2 here
+              propens(i) = (0.5*pop(ii)*(pop(ii)-1)) * 2.0 * ktst(i) / (Volume)   ! Note factor of 2 here
            endif
 
         else if (rxntype(i) == 'U') then
@@ -1626,7 +1644,7 @@ Subroutine Stochastic(Tstop,pop,ktst,rid,pid,rxntype,prodtype,volume,nrxn,nmol,i
      flux(irxn) = flux(irxn) + 1.d0
      fluxtot = fluxtot + 1.d0
 
-!     write(6,*)'HERE: ',irxn,flux(irxn), fluxtot
+!     write(6,*)'HERE: ',time,irxn,flux(irxn), fluxtot
 
 
 
@@ -1847,3 +1865,60 @@ Subroutine GetDerivs(derivs,stoichtr,ktst,conc,rxntype,prodtype,rid,pid,nmol,nrx
 
   return
 end Subroutine GetDerivs
+
+
+Subroutine SVD_inverse(A, Ainv, n, cond, svdeps)
+  implicit none
+  integer :: n,LWORK,INFO,i,j
+  double precision :: A(n,n), Ainv(n,n), cond,svdeps
+  double precision, allocatable :: Astore(:,:), sigma(:), s(:,:),work(:)
+  double precision, allocatable :: U(:,:), UT(:,:), V(:,:), VT(:,:)
+
+  LWORK = 5 * n
+
+  allocate ( Astore(n,n) )
+  allocate ( sigma(n), s(n,n) )
+  allocate ( U(n,n), UT(n,n), V(n,n), VT(n,n) )
+  allocate ( work(LWORK) )
+  Astore = A
+
+  Call DGESVD( 'A', 'A', n, n, A, n, sigma,U,n,VT,n,work,LWORK,INFO)
+
+  ! Check that everything worked correctly with the matrix inversion.
+  if (info.ne.0) then
+     write(6,*)'WARNING: Singular matrix detected in DGESVD'
+     stop
+  endif
+
+  A = Astore
+
+  cond = sigma(1) / sigma(n)
+
+  ! Calculate the inverse matrix, A^-1 = V * (1/sigma) * Ut. Note that we
+  ! regularize the inversion by removing singular values less than svdeps
+  !
+  S(:,:) = 0.0
+  do i = 1, n
+     if (sigma(i).le.svdeps)then
+        S(i,i) = 0.d0
+     else
+        S(i,i) = 1.d0 / Sigma(i)
+     endif
+  enddo
+  do i = 1, n
+     do j = 1, n
+        UT(i,j) = U(j,i)
+        V(i,j) = VT(j,i)
+     enddo
+  enddo
+  U = matmul(S,UT)
+  Ainv = matmul(V,U)
+
+  deallocate ( Astore )
+  deallocate (s, sigma)
+  deallocate ( u,ut,v,vt)
+  deallocate ( work )
+
+  return
+end Subroutine SVD_inverse
+
