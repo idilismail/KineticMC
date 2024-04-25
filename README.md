@@ -1,4 +1,4 @@
-# KineticMC
+# Kinetic Monte Carlo (KMC)
 
 Implements Gillespie's SSA algorithm for chemical reaction simulation, as well as direct simulation.
 
